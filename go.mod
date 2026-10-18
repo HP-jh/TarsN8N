@@ -1,3 +1,3 @@
 module github.com/HP-jh/TarsN8N
 
-go 1.23
+go 1.22
