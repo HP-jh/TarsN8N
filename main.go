@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,7 +17,7 @@ import (
 	"time"
 )
 
-var Version = "1.0.0"
+var Version = "1.1.0"
 const RepoName = "TarsN8N"
 
 type Client struct {
@@ -64,6 +65,16 @@ func (c *Client) req(ctx context.Context, method, path string, body interface{})
 	return result, nil
 }
 
+func validateEndpoint(endpoint string) error {
+	if endpoint == "" { return nil }
+	u, err := url.Parse(endpoint)
+	if err != nil { return fmt.Errorf("endpoint 格式错误: %w", err) }
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("endpoint 必须使用 http 或 https 协议")
+	}
+	return nil
+}
+
 func loadConfig() map[string]string {
 	return map[string]string{
 		"endpoint": os.Getenv("TARS_MCP_ENDPOINT"),
@@ -79,14 +90,17 @@ func main() {
 		return
 	}
 	cfg := loadConfig()
+	if err := validateEndpoint(cfg["endpoint"]); err != nil {
+		log.Fatalf("[%s] 配置错误: %v", RepoName, err)
+	}
 	client := NewClient(cfg["endpoint"], cfg["api_key"])
 	log.Printf("[%s] starting v%s endpoint=%s", RepoName, Version, cfg["endpoint"])
 	mode := os.Getenv("TARS_MCP_MODE")
 	if mode == "" { mode = "stdio" }
 	srv := &http.Server{Addr: ":8080", ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { withClient(client, healthHandler)(w, r) })
-	http.HandleFunc("/tools", func(w http.ResponseWriter, r *http.Request) { withClient(client, toolsHandler)(w, r) })
-	http.HandleFunc("/invoke", func(w http.ResponseWriter, r *http.Request) { withClient(client, invokeHandler)(w, r) })
+	http.HandleFunc("/health", withLogging(func(w http.ResponseWriter, r *http.Request) { withClient(client, healthHandler)(w, r) }))
+	http.HandleFunc("/tools", withLogging(func(w http.ResponseWriter, r *http.Request) { withClient(client, toolsHandler)(w, r) }))
+	http.HandleFunc("/invoke", withLogging(func(w http.ResponseWriter, r *http.Request) { withClient(client, invokeHandler)(w, r) }))
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -101,6 +115,14 @@ func main() {
 	log.Printf("[%s] HTTP listening on %s", RepoName, srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
+	}
+}
+
+func withLogging(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next(w, r)
+		log.Printf("[%s] %s %s %s", RepoName, r.Method, r.URL.Path, time.Since(start))
 	}
 }
 
@@ -149,6 +171,15 @@ func toolsHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 				"required":   []interface{}{"id"},
 			},
 		},
+		{
+			"name":        "n8n_workflow_detail",
+			"description": "Get workflow detail by ID",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{"id": map[string]interface{}{"type": "string", "description": "Workflow ID"}},
+				"required":   []interface{}{"id"},
+			},
+		},
 		},
 	})
 }
@@ -186,6 +217,16 @@ func invokeHandler(w http.ResponseWriter, r *http.Request, client *Client) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
+	case "n8n_workflow_detail":
+		if req.Params["id"] == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "缺少参数：id"}); return }
+		wid, _ := req.Params["id"].(string)
+		result, err := client.req(ctx, "GET", "/api/v1/workflows/"+wid, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("调用失败：%v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"result": result})
 	default:
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": fmt.Sprintf("不认识工具：%s", req.Tool)})
@@ -204,7 +245,7 @@ func runStdioServer(client *Client) {
 		var result map[string]interface{}
 		switch method {
 		case "tools/list":
-			result = map[string]interface{}{"tools": []map[string]interface{}{{"name": "n8n_workflows", "description": "List available workflows"}, {"name": "n8n_execute", "description": "Execute a workflow by ID"}}}
+			result = map[string]interface{}{"tools": []map[string]interface{}{{ "name": "n8n_workflows", "description": "List available workflows" }, { "name": "n8n_execute", "description": "Execute a workflow by ID" }, { "name": "n8n_workflow_detail", "description": "Get workflow detail by ID" }}}
 		case "tools/call":
 			params, _ := msg["params"].(map[string]interface{})
 			toolName, _ := params["name"].(string)
@@ -231,6 +272,15 @@ func handleStdioTool(ctx context.Context, client *Client, toolName string, args 
 	case "n8n_execute":
 		if args["id"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：id"}}} }
 		result, err := client.req(ctx, "POST", "/api/v1/workflows/{id}/execute", map[string]interface{}{"data": args["data"], "id": args["id"]})
+		if err != nil {
+			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("调用失败：%v", err)}}}
+		}
+		data, _ := json.Marshal(result)
+		return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": string(data)}}}
+	case "n8n_workflow_detail":
+		if args["id"] == nil { return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "缺少参数：id"}}} }
+		wid, _ := args["id"].(string)
+		result, err := client.req(ctx, "GET", "/api/v1/workflows/"+wid, nil)
 		if err != nil {
 			return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": fmt.Sprintf("调用失败：%v", err)}}}
 		}

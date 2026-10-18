@@ -61,3 +61,23 @@ func TestClientReq_MockServer(t *testing.T) {
 	if err != nil { t.Fatalf("unexpected err: %v", err) }
 	if res["status"] != "ok" { t.Fatalf("expected ok, got %v", res["status"]) }
 }
+
+func TestInvokeHandler_WorkflowDetail(t *testing.T) {
+	client := NewClient("", "")
+	body, _ := json.Marshal(map[string]interface{}{"tool": "n8n_workflow_detail", "params": map[string]interface{}{"id": "wf-123"}})
+	req := httptest.NewRequest(http.MethodPost, "/invoke", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	withClient(client, invokeHandler)(w, req)
+	if w.Code != http.StatusBadRequest && w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 400 or 502, got %d", w.Code)
+	}
+}
+
+func TestValidateEndpoint(t *testing.T) {
+	if err := validateEndpoint("not-a-url"); err == nil {
+		t.Fatal("expected error for invalid endpoint")
+	}
+	if err := validateEndpoint("https://api.example.com"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
